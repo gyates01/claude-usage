@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
+TRADINGAGENTS_LOG_DIR = Path.home() / ".tradingagents" / "usage-log"
 DB_PATH = Path.home() / ".claude" / "usage.db"
-DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
+DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR, TRADINGAGENTS_LOG_DIR]
 
 
 def get_db(db_path=DB_PATH):

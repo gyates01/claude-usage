@@ -40,14 +40,14 @@ No `pip install`, no virtual environment, no build step.
 
 ### Windows
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/gyates01/claude-usage
 cd claude-usage
 python cli.py dashboard
 ```
 
 ### macOS / Linux
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/gyates01/claude-usage
 cd claude-usage
 python3 cli.py dashboard
 ```

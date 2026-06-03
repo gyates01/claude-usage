@@ -271,8 +271,11 @@ def cmd_dashboard(projects_dir=None):
     print("\nStarting dashboard server...")
     from dashboard import serve
 
-    host = os.environ.get("HOST", "localhost")
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
+
+    from dashboard import _find_free_port
+    port = _find_free_port(host, port)
 
     def open_browser():
         time.sleep(1.0)

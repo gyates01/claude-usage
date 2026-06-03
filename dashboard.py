@@ -5,7 +5,17 @@ dashboard.py - Local web dashboard served on localhost:8080.
 import json
 import os
 import sqlite3
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+class _HTTPServer(HTTPServer):
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 from pathlib import Path
 from datetime import datetime
 
@@ -306,6 +316,8 @@ let sessionSortDir = 'desc';
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
+  'claude-opus-4-8':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
+  'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
@@ -327,7 +339,7 @@ function getPricing(model) {
     if (model.startsWith(key)) return PRICING[key];
   }
   const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-6'];
+  if (m.includes('opus'))   return PRICING['claude-opus-4-8'];
   if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
   if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
   return null;
@@ -932,16 +944,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+def _find_free_port(host, start_port, attempts=10):
+    for p in range(start_port, start_port + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, p))
+                return p
+            except OSError:
+                continue
+    raise OSError(f"No free port found in range {start_port}–{start_port + attempts - 1}")
+
+
 def serve(host=None, port=None):
-    host = host or os.environ.get("HOST", "localhost")
+    host = host or os.environ.get("HOST", "127.0.0.1")
     port = port or int(os.environ.get("PORT", "8080"))
-    server = HTTPServer((host, port), DashboardHandler)
+    port = _find_free_port(host, port)
+    server = _HTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    return port
 
 
 if __name__ == "__main__":

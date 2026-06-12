@@ -47,6 +47,8 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(output_tokens)         as output,
             SUM(cache_read_tokens)     as cache_read,
             SUM(cache_creation_tokens) as cache_creation,
+            SUM(COALESCE(cache_5m_tokens, 0)) as cache_5m,
+            SUM(COALESCE(cache_1h_tokens, 0)) as cache_1h,
             COUNT(*)                   as turns
         FROM turns
         GROUP BY day, model
@@ -60,6 +62,8 @@ def get_dashboard_data(db_path=DB_PATH):
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
         "cache_creation": r["cache_creation"] or 0,
+        "cache_5m":       r["cache_5m"] or 0,
+        "cache_1h":       r["cache_1h"] or 0,
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
@@ -68,7 +72,11 @@ def get_dashboard_data(db_path=DB_PATH):
         SELECT
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
-            total_cache_read, total_cache_creation, model, turn_count
+            total_cache_read, total_cache_creation,
+            COALESCE(total_cache_5m, 0) as total_cache_5m,
+            COALESCE(total_cache_1h, 0) as total_cache_1h,
+            COALESCE(billing, 'subscription') as billing,
+            model, turn_count
         FROM sessions
         ORDER BY last_timestamp DESC
     """).fetchall()
@@ -93,7 +101,52 @@ def get_dashboard_data(db_path=DB_PATH):
             "output":        r["total_output_tokens"] or 0,
             "cache_read":    r["total_cache_read"] or 0,
             "cache_creation": r["total_cache_creation"] or 0,
+            "cache_5m":      r["total_cache_5m"] or 0,
+            "cache_1h":      r["total_cache_1h"] or 0,
+            "billing":       r["billing"] or "subscription",
         })
+
+    # ── Tool usage per day/model (client filters by range and model) ──────────
+    tool_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)   as day,
+            COALESCE(model, 'unknown') as model,
+            tool_name,
+            COUNT(*)                   as uses
+        FROM turns
+        WHERE tool_name IS NOT NULL AND tool_name != ''
+        GROUP BY day, model, tool_name
+    """).fetchall()
+    daily_tools = [{
+        "day":   r["day"],
+        "model": r["model"],
+        "tool":  r["tool_name"],
+        "uses":  r["uses"],
+    } for r in tool_rows]
+
+    # ── Hourly activity in local time (for day-of-week x hour heatmap) ────────
+    hourly_rows = conn.execute("""
+        SELECT
+            substr(datetime(timestamp, 'localtime'), 1, 10)           as day,
+            CAST(strftime('%w', datetime(timestamp, 'localtime')) AS INTEGER) as dow,
+            CAST(strftime('%H', datetime(timestamp, 'localtime')) AS INTEGER) as hour,
+            COALESCE(model, 'unknown') as model,
+            COUNT(*)                   as turns
+        FROM turns
+        WHERE timestamp IS NOT NULL AND timestamp != ''
+        GROUP BY day, dow, hour, model
+    """).fetchall()
+    hourly = [{
+        "day":   r["day"],
+        "dow":   r["dow"],
+        "hour":  r["hour"],
+        "model": r["model"],
+        "turns": r["turns"],
+    } for r in hourly_rows]
+
+    data_since = conn.execute(
+        "SELECT MIN(substr(timestamp, 1, 10)) FROM turns"
+    ).fetchone()[0]
 
     conn.close()
 
@@ -101,6 +154,9 @@ def get_dashboard_data(db_path=DB_PATH):
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
+        "daily_tools":    daily_tools,
+        "hourly":         hourly,
+        "data_since":     data_since or "",
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -160,6 +216,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
   .chart-card.wide { grid-column: 1 / -1; }
   .chart-card h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
+  .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .chart-header h2 { margin-bottom: 0; }
+  #heatmap { display: grid; grid-template-columns: 34px repeat(24, 1fr); gap: 2px; }
+  .hm-cell { aspect-ratio: 1; border-radius: 2px; background: rgba(255,255,255,0.04); min-width: 0; }
+  .hm-label { font-size: 10px; color: var(--muted); display: flex; align-items: center; }
+  .hm-hour { font-size: 9px; color: var(--muted); text-align: center; }
+  .stat-card.clickable { cursor: pointer; }
+  .stat-card.clickable:hover { border-color: var(--accent); }
   .chart-wrap { position: relative; height: 240px; }
   .chart-wrap.tall { height: 300px; }
 
@@ -197,7 +261,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <header>
   <h1>Claude Code Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  <button id="rescan-btn" onclick="triggerRescan()" title="Re-read all JSONL files and merge into the database (duplicates are skipped). History from transcripts Claude Code has deleted is preserved.">&#x21bb; Rescan</button>
 </header>
 
 <div id="filter-bar">
@@ -219,7 +283,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="stats-row" id="stats-row"></div>
   <div class="charts-grid">
     <div class="chart-card wide">
-      <h2 id="daily-chart-title">Daily Token Usage</h2>
+      <div class="chart-header">
+        <h2 id="daily-chart-title">Daily Token Usage</h2>
+        <div class="range-group">
+          <button class="range-btn daily-mode-btn active" data-mode="tokens" onclick="setDailyMode('tokens')">Tokens</button>
+          <button class="range-btn daily-mode-btn" data-mode="cost" onclick="setDailyMode('cost')">Cost</button>
+        </div>
+      </div>
       <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
     </div>
     <div class="chart-card">
@@ -229,6 +299,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="chart-card">
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h2>Top Tools by Uses</h2>
+      <div class="chart-wrap"><canvas id="chart-tools"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h2>Activity Heatmap <span class="muted" style="text-transform:none;font-weight:400">(turns, local time)</span></h2>
+      <div id="heatmap"></div>
     </div>
   </div>
   <div class="table-card">
@@ -240,7 +318,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
         <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
         <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
-        <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
+        <th class="sortable" onclick="setModelSort('cache_5m')" title="5-minute TTL cache writes, billed at 1.25x input price">Cache 5m <span class="sort-icon" id="msort-cache_5m"></span></th>
+        <th class="sortable" onclick="setModelSort('cache_1h')" title="1-hour TTL cache writes, billed at 2x input price">Cache 1h <span class="sort-icon" id="msort-cache_1h"></span></th>
         <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
       </tr></thead>
       <tbody id="model-cost-body"></tbody>
@@ -281,7 +360,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of June 2026. Cache writes are priced by TTL (5-minute writes at 1.25&times; input, 1-hour writes at 2&times; input). Only models containing <em>fable</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
       GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
@@ -313,23 +392,28 @@ let projectSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByProject = [];
 let sessionSortDir = 'desc';
+let dailyMode = 'tokens';
+let planPrice = parseFloat(localStorage.getItem('planPrice')) || 17;
+let apiProjects = JSON.parse(localStorage.getItem('apiProjects') || 'null') || [];
 
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
+// ── Pricing (Anthropic API, June 2026) ─────────────────────────────────────
+// cache_write_5m = 1.25x input (5-minute TTL); cache_write_1h = 2x input (1-hour TTL)
 const PRICING = {
-  'claude-opus-4-8':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
+  'claude-fable-5':    { input: 10.00, output: 50.00, cache_write_5m: 12.50, cache_write_1h: 20.00, cache_read: 1.00 },
+  'claude-opus-4-8':   { input:  5.00, output: 25.00, cache_write_5m:  6.25, cache_write_1h: 10.00, cache_read: 0.50 },
+  'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write_5m:  6.25, cache_write_1h: 10.00, cache_read: 0.50 },
+  'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write_5m:  6.25, cache_write_1h: 10.00, cache_read: 0.50 },
+  'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write_5m:  6.25, cache_write_1h: 10.00, cache_read: 0.50 },
+  'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write_5m:  3.75, cache_write_1h:  6.00, cache_read: 0.30 },
+  'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write_5m:  3.75, cache_write_1h:  6.00, cache_read: 0.30 },
+  'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write_5m:  1.25, cache_write_1h:  2.00, cache_read: 0.10 },
+  'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write_5m:  1.25, cache_write_1h:  2.00, cache_read: 0.10 },
 };
 
 function isBillable(model) {
   if (!model) return false;
   const m = model.toLowerCase();
-  return m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
+  return m.includes('fable') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
 }
 
 function getPricing(model) {
@@ -339,22 +423,44 @@ function getPricing(model) {
     if (model.startsWith(key)) return PRICING[key];
   }
   const m = model.toLowerCase();
+  if (m.includes('fable'))  return PRICING['claude-fable-5'];
   if (m.includes('opus'))   return PRICING['claude-opus-4-8'];
   if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
   if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
   return null;
 }
 
-function calcCost(model, inp, out, cacheRead, cacheCreation) {
+function calcCost(model, inp, out, cacheRead, cache5m, cache1h) {
   if (!isBillable(model)) return 0;
   const p = getPricing(model);
   if (!p) return 0;
   return (
-    inp           * p.input       / 1e6 +
-    out           * p.output      / 1e6 +
-    cacheRead     * p.cache_read  / 1e6 +
-    cacheCreation * p.cache_write / 1e6
+    inp       * p.input          / 1e6 +
+    out       * p.output         / 1e6 +
+    cacheRead * p.cache_read     / 1e6 +
+    cache5m   * p.cache_write_5m / 1e6 +
+    cache1h   * p.cache_write_1h / 1e6
   );
+}
+
+// Net dollar savings from caching vs paying full input price for every token:
+// reads save (input - cache_read) per token; writes cost a premium over input price.
+function calcCacheSavings(model, cacheRead, cache5m, cache1h) {
+  if (!isBillable(model)) return 0;
+  const p = getPricing(model);
+  if (!p) return 0;
+  return (
+    cacheRead * (p.input - p.cache_read)          / 1e6 -
+    cache5m   * (p.cache_write_5m - p.input)      / 1e6 -
+    cache1h   * (p.cache_write_1h - p.input)      / 1e6
+  );
+}
+
+// Rows scanned before the TTL-breakdown upgrade have no 5m/1h split — assume 5m.
+function cacheSplit(o) {
+  const c5 = o.cache_5m || 0, c1 = o.cache_1h || 0;
+  if (c5 + c1 === 0 && (o.cache_creation || 0) > 0) return [o.cache_creation, 0];
+  return [c5, c1];
 }
 
 // ── Formatting ─────────────────────────────────────────────────────────────
@@ -395,20 +501,67 @@ function readURLRange() {
 
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
+  document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.range === range)
   );
   updateURL();
   applyFilter();
 }
 
+function setDailyMode(mode) {
+  dailyMode = mode;
+  document.querySelectorAll('.daily-mode-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.mode === mode)
+  );
+  applyFilter();
+}
+
+function editPlanPrice() {
+  const v = prompt('Monthly subscription price in USD (e.g. 17 for Pro annual, 20 for Pro monthly, 100/200 for Max):', planPrice);
+  const n = parseFloat(v);
+  if (!isNaN(n) && n > 0) {
+    planPrice = n;
+    localStorage.setItem('planPrice', String(n));
+    applyFilter();
+  }
+}
+
+// API-billed = scanner tagged the session as coming from an app's own usage
+// log (e.g. ~/.tradingagents/usage-log), plus any user-set project overrides.
+// Claude Code sessions in the same project folder stay subscription-billed.
+function isApiBilled(s) {
+  if (s.billing === 'api') return true;
+  const p = (s.project || '').toLowerCase();
+  return apiProjects.some(frag => frag && p.includes(frag.toLowerCase()));
+}
+
+function editApiProjects() {
+  const v = prompt('Extra projects to count as API-billed (comma-separated name fragments; app usage logs are detected automatically):', apiProjects.join(', '));
+  if (v === null) return;
+  apiProjects = v.split(',').map(s => s.trim()).filter(Boolean);
+  localStorage.setItem('apiProjects', JSON.stringify(apiProjects));
+  applyFilter();
+}
+
+// Days covered by the current range (for prorating the monthly plan price)
+function rangeDays() {
+  if (selectedRange === '7d')  return 7;
+  if (selectedRange === '30d') return 30;
+  if (selectedRange === '90d') return 90;
+  const since = rawData && rawData.data_since;
+  if (!since) return 30;
+  const ms = Date.now() - new Date(since + 'T00:00:00').getTime();
+  return Math.max(1, Math.ceil(ms / 86400000));
+}
+
 // ── Model filter ───────────────────────────────────────────────────────────
 function modelPriority(m) {
   const ml = m.toLowerCase();
-  if (ml.includes('opus'))   return 0;
-  if (ml.includes('sonnet')) return 1;
-  if (ml.includes('haiku'))  return 2;
-  return 3;
+  if (ml.includes('fable'))  return 0;
+  if (ml.includes('opus'))   return 1;
+  if (ml.includes('sonnet')) return 2;
+  if (ml.includes('haiku'))  return 3;
+  return 4;
 }
 
 function readURLModels(allModels) {
@@ -494,8 +647,8 @@ function sortSessions(sessions) {
   return [...sessions].sort((a, b) => {
     let av, bv;
     if (sessionSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = calcCost(a.model, a.input, a.output, a.cache_read, ...cacheSplit(a));
+      bv = calcCost(b.model, b.input, b.output, b.cache_read, ...cacheSplit(b));
     } else if (sessionSortCol === 'duration_min') {
       av = parseFloat(a.duration_min) || 0;
       bv = parseFloat(b.duration_min) || 0;
@@ -535,12 +688,15 @@ function applyFilter() {
   // By model: aggregate tokens + turns from daily data
   const modelMap = {};
   for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, cache_5m: 0, cache_1h: 0, turns: 0, sessions: 0 };
     const m = modelMap[r.model];
+    const [r5, r1] = cacheSplit(r);
     m.input          += r.input;
     m.output         += r.output;
     m.cache_read     += r.cache_read;
     m.cache_creation += r.cache_creation;
+    m.cache_5m       += r5;
+    m.cache_1h       += r1;
     m.turns          += r.turns;
   }
 
@@ -567,7 +723,7 @@ function applyFilter() {
     p.cache_creation += s.cache_creation;
     p.turns          += s.turns;
     p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, ...cacheSplit(s));
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
@@ -579,16 +735,39 @@ function applyFilter() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
+    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_5m, m.cache_1h), 0),
+    cache_savings:  byModel.reduce((s, m) => s + calcCacheSavings(m.model, m.cache_read, m.cache_5m, m.cache_1h), 0),
+    api_cost:       filteredSessions.reduce((sum, s) =>
+                      sum + (isApiBilled(s) ? calcCost(s.model, s.input, s.output, s.cache_read, ...cacheSplit(s)) : 0), 0),
   };
 
+  // Tools: aggregate uses per tool from filtered rows
+  const filteredTools = (rawData.daily_tools || []).filter(r =>
+    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+  );
+  const toolMap = {};
+  for (const r of filteredTools) toolMap[r.tool] = (toolMap[r.tool] || 0) + r.uses;
+  const byTool = Object.entries(toolMap)
+    .map(([tool, uses]) => ({ tool, uses }))
+    .sort((a, b) => b.uses - a.uses);
+
+  // Heatmap: day-of-week x hour turn counts (local time)
+  const heatGrid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+  for (const r of (rawData.hourly || [])) {
+    if (!selectedModels.has(r.model) || (cutoff && r.day < cutoff)) continue;
+    heatGrid[r.dow][r.hour] += r.turns;
+  }
+
   // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent =
+    (dailyMode === 'cost' ? 'Daily Cost' : 'Daily Token Usage') + ' \u2014 ' + RANGE_LABELS[selectedRange];
 
   renderStats(totals);
-  renderDailyChart(daily);
+  renderDailyChart(daily, filteredDaily);
   renderModelChart(byModel);
   renderProjectChart(byProject);
+  renderToolsChart(byTool);
+  renderHeatmap(heatGrid);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
   renderSessionsTable(lastFilteredSessions.slice(0, 20));
@@ -599,6 +778,9 @@ function applyFilter() {
 // ── Renderers ──────────────────────────────────────────────────────────────
 function renderStats(t) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  // Hit rate = share of all prompt tokens served from cache (reads / all input-side tokens)
+  const promptTokens = t.input + t.cache_read + t.cache_creation;
+  const hitRate = promptTokens > 0 ? (t.cache_read / promptTokens * 100) : 0;
   const stats = [
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
@@ -606,10 +788,33 @@ function renderStats(t) {
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Cache Hit Rate', value: hitRate.toFixed(1) + '%',    sub: '% of prompt tokens cached', color: hitRate > 70 ? '#4ade80' : hitRate > 40 ? '#fbbf24' : '#f87171' },
+    { label: 'Cache Savings',  value: fmtCostBig(t.cache_savings), sub: 'net vs. uncached input', color: '#4f8ef7' },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Jun 2026', color: '#4ade80' },
   ];
+  // Split real API spend (key-billed projects) from subscription-covered usage
+  const subCost = Math.max(0, t.cost - t.api_cost);
+  stats.push({
+    label: 'API Billed',
+    value: fmtCostBig(t.api_cost),
+    sub: 'from app usage logs' + (apiProjects.length ? ' + ' + apiProjects.join(', ') : '') + ' — click to edit',
+    color: '#f87171',
+    onclick: 'editApiProjects()',
+    title: 'Estimated spend billed to an API key: sessions ingested from app usage logs (e.g. TradingAgents), plus any project overrides you add. Only locally-logged API calls are counted. Click to add overrides.',
+  });
+  // Plan value: subscription-covered API-equivalent cost vs plan price prorated to the range
+  const planProrated = planPrice * rangeDays() / 30;
+  const planPct = planProrated > 0 ? (subCost / planProrated * 100) : 0;
+  stats.push({
+    label: 'Plan Value',
+    value: planPct.toFixed(0) + '%',
+    sub: `${fmtCostBig(subCost)} on plan vs $${Math.round(planProrated)} — click to set`,
+    color: planPct >= 100 ? '#4ade80' : '#fbbf24',
+    onclick: 'editPlanPrice()',
+    title: `Subscription-covered usage (excludes API-billed projects) vs your $${planPrice}/mo plan, prorated to the selected range. Click to change the plan price.`,
+  });
   document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <div class="stat-card">
+    <div class="stat-card${s.onclick ? ' clickable' : ''}"${s.onclick ? ` onclick="${s.onclick}"` : ''}${s.title ? ` title="${esc(s.title)}"` : ''}>
       <div class="label">${s.label}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
@@ -617,29 +822,95 @@ function renderStats(t) {
   `).join('');
 }
 
-function renderDailyChart(daily) {
+function renderDailyChart(daily, filteredDaily) {
   const ctx = document.getElementById('chart-daily').getContext('2d');
   if (charts.daily) charts.daily.destroy();
+
+  let datasets, labels, yFmt;
+  if (dailyMode === 'cost') {
+    // Stacked $ per day, one dataset per model
+    labels = daily.map(d => d.day);
+    const dayIdx = Object.fromEntries(labels.map((d, i) => [d, i]));
+    const perModel = {};
+    for (const r of filteredDaily) {
+      if (!(r.day in dayIdx)) continue;
+      if (!perModel[r.model]) perModel[r.model] = new Array(labels.length).fill(0);
+      perModel[r.model][dayIdx[r.day]] += calcCost(r.model, r.input, r.output, r.cache_read, ...cacheSplit(r));
+    }
+    datasets = Object.keys(perModel).sort().map((m, i) => ({
+      label: m, data: perModel[m], backgroundColor: MODEL_COLORS[i % MODEL_COLORS.length], stack: 'cost'
+    }));
+    yFmt = v => '$' + v.toFixed(v >= 10 ? 0 : 2);
+  } else {
+    labels = daily.map(d => d.day);
+    datasets = [
+      { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
+      { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
+      { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
+      { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
+    ];
+    yFmt = v => fmt(v);
+  }
+
   charts.daily = new Chart(ctx, {
     type: 'bar',
-    data: {
-      labels: daily.map(d => d.day),
-      datasets: [
-        { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
-        { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
-        { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
-        { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
-      ]
-    },
+    data: { labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
+      plugins: {
+        legend: { labels: { color: '#8892a4', boxWidth: 12 } },
+        tooltip: dailyMode === 'cost'
+          ? { callbacks: { label: c => ` ${c.dataset.label}: $${c.raw.toFixed(2)}` } }
+          : {},
+      },
       scales: {
         x: { ticks: { color: '#8892a4', maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4', callback: yFmt }, grid: { color: '#2a2d3a' } },
       }
     }
   });
+}
+
+function renderToolsChart(byTool) {
+  const top = byTool.slice(0, 10);
+  const ctx = document.getElementById('chart-tools').getContext('2d');
+  if (charts.tools) charts.tools.destroy();
+  if (!top.length) { charts.tools = null; return; }
+  charts.tools = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: top.map(t => t.tool.length > 24 ? t.tool.slice(0, 22) + '…' : t.tool),
+      datasets: [{ label: 'Uses', data: top.map(t => t.uses), backgroundColor: TOKEN_COLORS.input }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4', font: { size: 11 } }, grid: { color: '#2a2d3a' } },
+      }
+    }
+  });
+}
+
+const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function renderHeatmap(grid) {
+  const max = Math.max(1, ...grid.flat());
+  const cells = ['<div class="hm-label"></div>'];
+  for (let h = 0; h < 24; h++) {
+    cells.push(`<div class="hm-hour">${h % 3 === 0 ? h : ''}</div>`);
+  }
+  for (const dow of [1, 2, 3, 4, 5, 6, 0]) {  // Monday-first
+    cells.push(`<div class="hm-label">${DOW_LABELS[dow]}</div>`);
+    for (let h = 0; h < 24; h++) {
+      const v = grid[dow][h];
+      const alpha = v > 0 ? 0.15 + 0.85 * Math.sqrt(v / max) : 0;
+      const bg = v > 0 ? `background:rgba(217,119,87,${alpha.toFixed(3)})` : '';
+      cells.push(`<div class="hm-cell" style="${bg}" title="${DOW_LABELS[dow]} ${h}:00 — ${v} turns"></div>`);
+    }
+  }
+  document.getElementById('heatmap').innerHTML = cells.join('');
 }
 
 function renderModelChart(byModel) {
@@ -689,7 +960,7 @@ function renderProjectChart(byProject) {
 
 function renderSessionsTable(sessions) {
   document.getElementById('sessions-body').innerHTML = sessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = calcCost(s.model, s.input, s.output, s.cache_read, ...cacheSplit(s));
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
@@ -728,8 +999,8 @@ function sortModels(byModel) {
   return [...byModel].sort((a, b) => {
     let av, bv;
     if (modelSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_5m, a.cache_1h);
+      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_5m, b.cache_1h);
     } else {
       av = a[modelSortCol] ?? 0;
       bv = b[modelSortCol] ?? 0;
@@ -742,7 +1013,7 @@ function sortModels(byModel) {
 
 function renderModelCostTable(byModel) {
   document.getElementById('model-cost-body').innerHTML = sortModels(byModel).map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_5m, m.cache_1h);
     const costCell = isBillable(m.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
@@ -752,7 +1023,8 @@ function renderModelCostTable(byModel) {
       <td class="num">${fmt(m.input)}</td>
       <td class="num">${fmt(m.output)}</td>
       <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
+      <td class="num">${fmt(m.cache_5m)}</td>
+      <td class="num">${fmt(m.cache_1h)}</td>
       ${costCell}
     </tr>`;
   }).join('');
@@ -830,7 +1102,7 @@ function downloadCSV(reportType, header, rows) {
 function exportSessionsCSV() {
   const header = ['Session', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = calcCost(s.model, s.input, s.output, s.cache_read, ...cacheSplit(s));
     return [s.session_id, s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
@@ -870,7 +1142,9 @@ async function loadData() {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + esc(d.error) + '</div>';
       return;
     }
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in 30s';
+    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at
+      + (d.data_since ? ' \u00b7 Data since ' + d.data_since : '')
+      + ' \u00b7 Auto-refresh in 30s';
 
     const isFirstLoad = rawData === null;
     rawData = d;
@@ -878,7 +1152,7 @@ async function loadData() {
     if (isFirstLoad) {
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
-      document.querySelectorAll('.range-btn').forEach(btn =>
+      document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
       // Build model filter (reads URL for model selection too)
@@ -928,9 +1202,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/rescan":
-            # Full rebuild: delete DB and rescan from scratch
+            # Force re-read of all files WITHOUT deleting the DB. Turns from
+            # transcripts Claude Code has since auto-deleted (~30-day retention)
+            # only exist in the DB — dropping it would lose that history.
+            # Re-read turns dedup via the unique message_id index.
             if DB_PATH.exists():
-                DB_PATH.unlink()
+                conn = sqlite3.connect(DB_PATH)
+                try:
+                    conn.execute("DELETE FROM processed_files")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+                conn.close()
             from scanner import scan
             result = scan(verbose=False)
             body = json.dumps(result).encode("utf-8")
